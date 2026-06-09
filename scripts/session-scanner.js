@@ -12,7 +12,7 @@
  * Top signals sent via iMessage and saved to ~/.tradingview-mcp/signals/
  */
 
-import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,34 @@ const CDP_PORT = 9222;
 const PHONE = '+61403644312';
 
 let WATCHLIST = []; // set in main() from rules.json; used by checkOpenTrade()
+
+// ── Single-instance lock ──────────────────────────────────────────────────────
+// Cron + multiple launchd timers can fire near the same wall-clock minute; two
+// scanners at once would both pkill/relaunch TradingView and fight over the CDP
+// port. This guard makes a second concurrent run exit cleanly instead.
+const LOCK_FILE = join(homedir(), '.tradingview-mcp', 'scanner.lock');
+const LOCK_STALE_MS = 20 * 60 * 1000; // a healthy scan never runs this long
+
+function acquireLock() {
+  mkdirSync(join(homedir(), '.tradingview-mcp'), { recursive: true });
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const { pid, ts } = JSON.parse(readFileSync(LOCK_FILE, 'utf8'));
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; }       // signal 0 = existence probe
+      catch (e) { if (e.code === 'EPERM') alive = true; } // exists but not ours to signal
+      if (alive && ts && (Date.now() - ts) < LOCK_STALE_MS) return false; // genuine concurrent run
+    } catch {} // unparseable → treat as stale, take over
+  }
+  writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+  return true;
+}
+function releaseLock() {
+  try {
+    const { pid } = JSON.parse(readFileSync(LOCK_FILE, 'utf8'));
+    if (pid === process.pid) unlinkSync(LOCK_FILE);
+  } catch {}
+}
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -624,10 +652,21 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error('Scanner failed:', err.message);
-  try {
-    execSync(`osascript -e 'display notification "${err.message.slice(0, 80)}" with title "Scanner FAILED" sound name "Basso"'`);
-  } catch {}
-  process.exit(1);
-});
+if (!acquireLock()) {
+  console.log('⏭  Another scan is already running — exiting to avoid TradingView/CDP conflict.');
+  process.exit(0);
+}
+process.on('exit', releaseLock);
+process.on('SIGINT', () => process.exit(130));
+process.on('SIGTERM', () => process.exit(143));
+
+main()
+  .then(() => releaseLock())
+  .catch(err => {
+    releaseLock();
+    console.error('Scanner failed:', err.message);
+    try {
+      execSync(`osascript -e 'display notification "${err.message.slice(0, 80)}" with title "Scanner FAILED" sound name "Basso"'`);
+    } catch {}
+    process.exit(1);
+  });
