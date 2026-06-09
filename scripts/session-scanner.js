@@ -18,12 +18,18 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
+import {
+  recordSignals, resolveOpenSignals, recomputeWeights, loadJournal,
+  edgeScore, factorsFromNotes, computeStats, writeXlsx,
+} from './lib/journal.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..');
 const SIGNALS_DIR = join(homedir(), '.tradingview-mcp', 'signals');
 const CDP_PORT = 9222;
 const PHONE = '+61403644312';
+
+let WATCHLIST = []; // set in main() from rules.json; used by checkOpenTrade()
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -163,8 +169,11 @@ function scoreSetup({ dailyStr, zone, h4Str, nearOB, nearFVG, smt, sweep }) {
 }
 
 // ── Entry levels ─────────────────────────────────────────────────────────────
-function buildSignal({ symbol, price, dailyStr, eq, bsl, ssl, entryOB, entryFVG, score }) {
-  const dir = dailyStr === 'BULLISH' ? 'LONG' : 'SHORT';
+// Note: scan results expose dStr / nearOB / nearFVG (not dailyStr / entryOB /
+// entryFVG), so we read those field names directly here.
+function buildSignal({ symbol, price, dStr, eq, bsl, ssl, nearOB, nearFVG, score }) {
+  const dir = dStr === 'BULLISH' ? 'LONG' : 'SHORT';
+  const entryOB = nearOB, entryFVG = nearFVG;
   const dp = price > 100 ? 2 : 5;
   const fmt = n => n.toFixed(dp);
 
@@ -191,6 +200,9 @@ function buildSignal({ symbol, price, dailyStr, eq, bsl, ssl, entryOB, entryFVG,
 
   const pips = n => Math.round(Math.abs(n - entryZone) * (price > 100 ? 10 : 10000));
 
+  // Has price already pulled into the entry zone? (within ~15 pips / 0.15%)
+  const atEntry = Math.abs(price - entryZone) / price <= 0.0015;
+
   return {
     symbol, dir, score, price: fmt(price),
     entry: fmt(entryZone), entryLabel,
@@ -198,6 +210,9 @@ function buildSignal({ symbol, price, dailyStr, eq, bsl, ssl, entryOB, entryFVG,
     tp1:  fmt(tp1),   r1: (pips(tp1) / pips(stop)).toFixed(1),
     tp2:  fmt(tp2),   r2: (pips(tp2) / pips(stop)).toFixed(1),
     tp3:  fmt(tp3),   r3: (pips(tp3) / pips(stop)).toFixed(1),
+    // numeric values for the journal / learning layer
+    priceNum: price, entryNum: entryZone, stopNum: stop,
+    tp1Num: tp1, tp2Num: tp2, tp3Num: tp3, atEntry,
   };
 }
 
@@ -238,61 +253,71 @@ function parseSignalsFromContent(content, signalTime) {
     const t1 = line.match(/TP1:\s+([\d.]+)/);   if (t1)  { cur.tp1 = +t1[1];  continue; }
     const t2 = line.match(/TP2:\s+([\d.]+)/);   if (t2)  { cur.tp2 = +t2[1];  continue; }
     const t3 = line.match(/TP3:\s+([\d.]+)/);   if (t3)  { cur.tp3 = +t3[1];  continue; }
+    const why = line.match(/Why:\s+(.+)/);      if (why) { cur.notes = why[1].split('·').map(s => s.trim()); continue; }
   }
   if (cur) signals.push(cur);
   return signals.filter(s => s.sl && s.tp1);
 }
 
-async function checkSignalStatus(sig, fullSymbol, chart, getOhlcv) {
-  try {
-    await chart.setSymbol({ symbol: fullSymbol }); await sleep(700);
-    await chart.setTimeframe({ timeframe: '60' }); await sleep(700);
-    const data = await getOhlcv({ count: 48 });
-    if (!data?.bars?.length) return { ...sig, status: 'NO_DATA', entry: null, currentPrice: null, currentPips: 0 };
+// One-time seed: import the latest .md signal file into the journal so tracking
+// starts with real history rather than an empty slate.
+function bootstrapJournalFromMd(watchlist) {
+  if (loadJournal().length > 0) return;
+  const prev = findPreviousSessionFile();
+  if (!prev) return;
+  const sigs = parseSignalsFromContent(prev.content, prev.signalTime);
+  if (!sigs.length) return;
+  const payload = sigs.map(s => ({
+    symbol: s.symbol, dir: s.dir, score: s.score, notes: s.notes ?? [],
+    entry: (s.tp1 + 2 * s.sl) / 3, sl: s.sl, tp1: s.tp1, tp2: s.tp2, tp3: s.tp3,
+    smtHit: (s.notes ?? []).some(n => n.includes('SMT')), riskPips: null,
+  }));
+  const r = recordSignals(payload, 'BOOTSTRAP', prev.signalTime);
+  console.log(`  Bootstrapped journal from ${prev.file}: +${r.added} trades`);
+}
 
-    const bars = data.bars;
-    const currentPrice = bars[bars.length - 1].close;
-    // Reconstruct entry: for both LONG and SHORT, entry = (tp1 + 2*sl) / 3
-    const entry = (sig.tp1 + 2 * sig.sl) / 3;
+// Chronological first-touch check for one open journal record.
+// Walks 1H bars from signal time forward and records the ORDER in which SL/TPs
+// are touched — so a trade that hit TP1 before SL is a win, not a loss.
+// Returns { firstHit, levelsHit, currentPrice, currentPips } for journal.resolveOpenSignals.
+async function checkOpenTrade(rec, chart, getOhlcv) {
+  const fullSymbol = WATCHLIST.find(s => s.endsWith(`:${rec.symbol}`)) ?? `FX:${rec.symbol}`;
+  await chart.setSymbol({ symbol: fullSymbol }); await sleep(700);
+  await chart.setTimeframe({ timeframe: '60' }); await sleep(700);
+  const data = await getOhlcv({ count: 200 });
+  if (!data?.bars?.length) throw new Error('no bars');
 
-    const signalTs = sig.signalTime.getTime() / 1000;
-    const barsAfter = bars.filter(b => b.time > signalTs);
-    const checkBars = barsAfter.length > 0 ? barsAfter : bars.slice(-8);
+  const bars = data.bars;
+  const currentPrice = bars[bars.length - 1].close;
+  const barsAfter = bars.filter(b => b.time > rec.ts);
+  const checkBars = barsAfter.length > 0 ? barsAfter : bars.slice(-8);
 
-    const { dir, sl, tp1, tp2, tp3 } = sig;
-    let slHit = false, tp1Hit = false, tp2Hit = false, tp3Hit = false;
-    for (const bar of checkBars) {
-      if (dir === 'LONG') {
-        if (bar.low  <= sl)        slHit  = true;
-        if (bar.high >= tp1)       tp1Hit = true;
-        if (tp2 && bar.high >= tp2) tp2Hit = true;
-        if (tp3 && bar.high >= tp3) tp3Hit = true;
-      } else {
-        if (bar.high >= sl)        slHit  = true;
-        if (bar.low  <= tp1)       tp1Hit = true;
-        if (tp2 && bar.low  <= tp2) tp2Hit = true;
-        if (tp3 && bar.low  <= tp3) tp3Hit = true;
-      }
-    }
+  const { dir, sl, tp1, tp2, tp3 } = rec;
+  let firstHit = null;
+  const levelsHit = [];
+  const hit = (lvl) => { if (!levelsHit.includes(lvl)) levelsHit.push(lvl); };
 
-    const mult = currentPrice > 100 ? 10 : 10000;
-    const currentPips = dir === 'LONG'
-      ? Math.round((currentPrice - entry) * mult)
-      : Math.round((entry - currentPrice) * mult);
+  for (const bar of checkBars) {
+    const slTouch  = dir === 'LONG' ? bar.low  <= sl  : bar.high >= sl;
+    const tp1Touch = dir === 'LONG' ? bar.high >= tp1 : bar.low  <= tp1;
+    const tp2Touch = tp2 != null && (dir === 'LONG' ? bar.high >= tp2 : bar.low <= tp2);
+    const tp3Touch = tp3 != null && (dir === 'LONG' ? bar.high >= tp3 : bar.low <= tp3);
 
-    let status;
-    if      (tp3Hit) status = 'TP3';
-    else if (tp2Hit) status = 'TP2';
-    else if (tp1Hit) status = 'TP1';
-    else if (slHit)  status = 'SL';
-    else if (currentPips >  5) status = 'PROFIT';
-    else if (currentPips < -5) status = 'LOSS';
-    else                       status = 'FLAT';
-
-    return { ...sig, status, entry, currentPrice, currentPips, slHit, tp1Hit, tp2Hit, tp3Hit };
-  } catch (e) {
-    return { ...sig, status: 'ERR', error: e.message, entry: null, currentPrice: null, currentPips: 0 };
+    // Determine first decisive touch (SL vs TP1) for win/loss attribution.
+    if (!firstHit && (slTouch || tp1Touch)) firstHit = (tp1Touch && !slTouch) ? 'TP1' : (slTouch && !tp1Touch) ? 'SL' : 'TP1';
+    if (tp1Touch) hit('TP1');
+    if (tp2Touch) hit('TP2');
+    if (tp3Touch) hit('TP3');
+    // Once SL is the decided outcome (no TP reached first), stop counting further TPs.
+    if (firstHit === 'SL') break;
   }
+
+  const mult = currentPrice > 100 ? 10 : 10000;
+  const currentPips = dir === 'LONG'
+    ? Math.round((currentPrice - rec.entry) * mult)
+    : Math.round((rec.entry - currentPrice) * mult);
+
+  return { firstHit, levelsHit, currentPrice, currentPips };
 }
 
 // ── Analyse one symbol ────────────────────────────────────────────────────────
@@ -414,64 +439,55 @@ async function main() {
   const rules         = JSON.parse(readFileSync(join(PROJECT_ROOT, 'rules.json'), 'utf8'));
   const { watchlist, smt_pairs } = rules;
   const smtMap        = smt_pairs?.forex ?? {};
+  WATCHLIST = watchlist;
 
-  // ── Previous session signal recap ─────────────────────────────────────────
-  const prevSession = findPreviousSessionFile();
+  // ── Resolve open trades from the journal (learning / recap) ────────────────
+  // One-time bootstrap: seed the journal from the latest .md signal file so we
+  // start tracking immediately instead of from an empty slate.
+  bootstrapJournalFromMd(watchlist);
+
   const recapLines = [];
+  console.log('\n📋 Open Trade Recap (journal)');
+  console.log('─'.repeat(60));
+  recapLines.push('📋 Open Trade Recap', '─'.repeat(60), '');
 
-  if (prevSession) {
-    const prevSigs = parseSignalsFromContent(prevSession.content, prevSession.signalTime);
-    const prevTimeStr = prevSession.signalTime.toLocaleString('en-AU', {
-      timeZone: 'Australia/Melbourne', dateStyle: 'short', timeStyle: 'short',
-    });
-    const recapHeader = `📋 Previous Session Recap — ${prevTimeStr} (${prevSigs.length} signal(s))`;
-    console.log(`\n${recapHeader}`);
-    console.log('─'.repeat(60));
-    recapLines.push(recapHeader, '─'.repeat(60), '');
+  const resolved = await resolveOpenSignals(
+    rec => { process.stdout.write(`  Checking ${rec.symbol.padEnd(10)}`); return checkOpenTrade(rec, chart, getOhlcv); },
+  );
 
-    const recapResults = [];
-    for (const sig of prevSigs) {
-      const fullSymbol = watchlist.find(s => s.endsWith(`:${sig.symbol}`)) ?? `FX:${sig.symbol}`;
-      process.stdout.write(`  Checking ${sig.symbol.padEnd(10)}`);
-      const checked = await checkSignalStatus(sig, fullSymbol, chart, getOhlcv);
-      recapResults.push(checked);
-
-      const statusIcon = { TP3:'🏆', TP2:'✅✅', TP1:'✅', SL:'❌', PROFIT:'🟢', LOSS:'🔴', FLAT:'⚪', NO_DATA:'❓', ERR:'⚠️' }[checked.status] ?? '?';
-      const dirIcon    = sig.dir === 'LONG' ? '🟢' : '🔴';
-      const entryStr   = checked.entry    != null ? fmt(checked.entry,    checked.entry)    : '?';
-      const currStr    = checked.currentPrice != null ? fmt(checked.currentPrice, checked.currentPrice) : '?';
-      const pipsSign   = checked.currentPips > 0 ? '+' : '';
-      const pipsStr    = checked.currentPips != null ? `${pipsSign}${checked.currentPips} pips` : '';
-
-      let statusLabel;
-      if      (checked.status === 'TP3')    statusLabel = `TP3 HIT 🏆  Full DOL target reached`;
-      else if (checked.status === 'TP2')    statusLabel = `TP2 HIT ✅✅ Strong runner`;
-      else if (checked.status === 'TP1')    statusLabel = `TP1 HIT ✅  Minimum objective met`;
-      else if (checked.status === 'SL')     statusLabel = `SL HIT ❌  (now ${pipsStr})`;
-      else if (checked.status === 'PROFIT') statusLabel = `Still open — IN PROFIT  ${pipsStr}`;
-      else if (checked.status === 'LOSS')   statusLabel = `Still open — AT LOSS    ${pipsStr}`;
-      else if (checked.status === 'FLAT')   statusLabel = `Still open — FLAT       ${pipsStr}`;
-      else                                  statusLabel = checked.status;
-
-      console.log(`  ${statusIcon} ${checked.status.padEnd(6)} ${statusLabel}`);
-
-      recapLines.push(`${dirIcon} ${sig.dir} ${sig.symbol} [${sig.score}/6] — ${statusLabel}`);
-      recapLines.push(`  Entry: ${entryStr}  Now: ${currStr}  SL: ${fmt(sig.sl, sig.sl)}  TP1: ${fmt(sig.tp1, sig.tp1)}`);
-      if (checked.tp1Hit || checked.tp2Hit || checked.tp3Hit) {
-        const hit = [checked.tp1Hit && 'TP1', checked.tp2Hit && 'TP2', checked.tp3Hit && 'TP3'].filter(Boolean).join(' ');
-        recapLines.push(`  Levels hit: ${hit}`);
+  if (resolved.length === 0) {
+    console.log('  (no open trades tracked yet — journal will fill as signals fire)');
+    recapLines.push('No open trades tracked yet.', '');
+  } else {
+    let justWon = 0, justLost = 0, openProfit = 0, openLoss = 0, openFlat = 0;
+    for (const r of resolved) {
+      const dirIcon = r.dir === 'LONG' ? '🟢' : '🔴';
+      const pipsStr = r.currentPips != null ? `${r.currentPips > 0 ? '+' : ''}${r.currentPips} pips` : '';
+      let label, icon;
+      switch (r.liveStatus) {
+        case 'TP3': label = 'WIN 🏆  TP3 — full DOL target'; icon = '🏆'; justWon++; break;
+        case 'TP2': label = 'WIN ✅✅ TP2 reached';          icon = '✅'; justWon++; break;
+        case 'TP1': label = 'WIN ✅  TP1 — min objective';   icon = '✅'; justWon++; break;
+        case 'LOSS':      label = `LOSS ❌  stop hit`;        icon = '❌'; justLost++; break;
+        case 'PROFIT':    label = `open — in profit  ${pipsStr}`; icon = '🟢'; openProfit++; break;
+        case 'LOSS_OPEN': label = `open — at loss    ${pipsStr}`; icon = '🔴'; openLoss++; break;
+        case 'FLAT':      label = `open — flat        ${pipsStr}`; icon = '⚪'; openFlat++; break;
+        case 'EXPIRED':   label = `expired (no fill in window)`; icon = '⏱'; break;
+        default:          label = r.liveStatus + (r.error ? ` (${r.error})` : ''); icon = '⚠️';
       }
+      console.log(`  ${icon} ${r.symbol.padEnd(8)} ${r.dir.padEnd(5)} ${label}`);
+      recapLines.push(`${dirIcon} ${r.dir} ${r.symbol} [${r.score}/6] — ${label}`);
+      if (r.levelsHit?.length) recapLines.push(`  Levels hit: ${r.levelsHit.join(' ')}  R: ${r.rMultiple ?? '?'}`);
       recapLines.push('');
-      await sleep(200);
     }
-
-    const wins   = recapResults.filter(r => ['TP3','TP2','TP1','PROFIT'].includes(r.status)).length;
-    const losses = recapResults.filter(r => r.status === 'SL' || r.status === 'LOSS').length;
-    const flat   = recapResults.length - wins - losses;
-    const summary = `Score: ${wins}W / ${losses}L / ${flat} flat  (${recapResults.length} signals checked)`;
+    const summary = `Resolved this run: ${justWon}W / ${justLost}L  ·  Still open: ${openProfit}🟢 ${openLoss}🔴 ${openFlat}⚪`;
     console.log(`\n  ${summary}`);
     recapLines.push(summary, '─'.repeat(60), '');
   }
+
+  // Recompute adaptive weights from everything resolved so far.
+  const { weights, learning, resolved: resolvedCount } = recomputeWeights();
+  console.log(`\n🧠 Adaptive scoring: ${learning ? 'ACTIVE' : 'warming up'} (${resolvedCount} resolved trades)`);
 
   const results = [];
 
@@ -481,17 +497,31 @@ async function main() {
     process.stdout.write(`  Scanning ${ticker.padEnd(10)}`);
     const r = await analyseSymbol(symbol, smtSymbol, chart, getOhlcv);
     if (!r) { console.log('  skip'); continue; }
+    r.edge = edgeScore(factorsFromNotes(r.notes), weights);
     const bar = '█'.repeat(r.score) + '░'.repeat(6 - r.score);
-    console.log(`  ${r.dStr.padEnd(8)} | ${r.zone.padEnd(9)} | 4H:${r.h4Str.padEnd(8)} | [${bar}] ${r.score}/6  ${r.smtHit ? '⚡SMT' : ''}`);
+    console.log(`  ${r.dStr.padEnd(8)} | ${r.zone.padEnd(9)} | 4H:${r.h4Str.padEnd(8)} | [${bar}] ${r.score}/6  edge ${r.edge.toFixed(1)}  ${r.smtHit ? '⚡SMT' : ''}`);
     results.push(r);
     await sleep(300);
   }
 
-  // Sort by score desc
-  results.sort((a, b) => b.score - a.score);
+  // Rank by learned edge (falls back to raw score while warming up).
+  results.sort((a, b) => b.edge - a.edge || b.score - a.score);
   const signals = results.filter(r => r.score >= 3 && r.dir);
 
-  console.log(`\n✅ Scan complete — ${signals.length} signal(s) found (score ≥ 3)\n`);
+  // Attach built signal details + record to journal.
+  const built = signals.map(r => ({ r, sig: buildSignal(r) }));
+  const recordPayload = built.map(({ r, sig }) => ({
+    symbol: r.symbol.split(':')[1] ?? r.symbol, dir: sig.dir, score: r.score, notes: r.notes,
+    entry: sig.entryNum, sl: sig.stopNum, tp1: sig.tp1Num, tp2: sig.tp2Num, tp3: sig.tp3Num,
+    smtHit: r.smtHit, riskPips: sig.riskPips,
+  }));
+  const rec = recordSignals(recordPayload, session.name);
+
+  // Actionable = the "place a trade now" set: score >= 4 OR price already at entry.
+  const actionable = built.filter(({ r, sig }) => r.score >= 4 || sig.atEntry);
+
+  console.log(`\n✅ Scan complete — ${signals.length} signal(s) ≥3/6 · ${actionable.length} actionable (≥4 or at entry)`);
+  console.log(`   Journal: +${rec.added} new, ${rec.updated} still-open updated\n`);
 
   // ── Build report ────────────────────────────────────────────────────────────
   const lines = [
@@ -507,10 +537,14 @@ async function main() {
     lines.push('');
     lines.push('Mark Douglas: Not trading because conditions are not met IS the correct decision.');
   } else {
-    for (const r of signals) {
-      const sig = buildSignal(r);
+    if (actionable.length) {
+      lines.push(`🔥 ${actionable.length} ACTIONABLE NOW (score ≥4 or price at entry):`, '');
+    }
+    for (const { r, sig } of built) {
       const icon = sig.dir === 'LONG' ? '🟢' : '🔴';
-      lines.push(`${icon} ${sig.dir} ${sig.symbol.split(':')[1] ?? sig.symbol}  [${sig.score}/6]`);
+      const act = (r.score >= 4 || sig.atEntry)
+        ? `  🔥 ${sig.atEntry ? 'PRICE AT ENTRY' : 'HIGH CONVICTION'}` : '';
+      lines.push(`${icon} ${sig.dir} ${sig.symbol.split(':')[1] ?? sig.symbol}  [${sig.score}/6 · edge ${r.edge.toFixed(1)}]${act}`);
       lines.push(`  Price:  ${sig.price}  |  Entry: ${sig.entryLabel}`);
       lines.push(`  SL:     ${sig.stop}  (${sig.riskPips} pip risk)`);
       lines.push(`  TP1:    ${sig.tp1}  (${sig.r1}:1 R:R)`);
@@ -527,6 +561,15 @@ async function main() {
   const report = lines.join('\n');
   console.log(report);
 
+  // Update the reviewable trade journal (.xlsx)
+  try {
+    const xlsxPath = writeXlsx();
+    const stats = computeStats();
+    console.log(`📒 Journal: ${xlsxPath}  (${stats.resolved} resolved · ${stats.resolved ? (stats.winRate * 100).toFixed(0) : 0}% win · ${stats.totalR > 0 ? '+' : ''}${stats.totalR}R)`);
+  } catch (e) {
+    console.error(`xlsx write failed: ${e.message}`);
+  }
+
   // Save to file
   mkdirSync(SIGNALS_DIR, { recursive: true });
   const dateKey = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
@@ -534,45 +577,48 @@ async function main() {
   writeFileSync(outFile, report);
   console.log(`\nSaved: ${outFile}`);
 
-  // macOS notification
+  // macOS notification — loud (with sound) only when there's something to act on.
   try {
-    const notifMsg = signals.length
-      ? `${signals.length} signal(s): ${signals.slice(0, 3).map(r => r.symbol.split(':')[1]).join(', ')}`
-      : 'No signals this session';
-    execSync(`osascript -e 'display notification "${notifMsg}" with title "ICT Scanner — ${session.name}" subtitle "${nowStr}"'`);
+    const recapSummary = recapLines.find(l => l.startsWith('Resolved this run:')) || '';
+    const notifMsg = actionable.length
+      ? `🔥 ${actionable.length} to place: ${actionable.slice(0, 3).map(({ sig }) => sig.symbol.split(':')[1]).join(', ')}`
+      : `${signals.length} on radar · ${recapSummary.replace('Resolved this run: ', '') || 'nothing actionable'}`;
+    const sound = actionable.length ? ' sound name "Glass"' : '';
+    execSync(`osascript -e 'display notification "${notifMsg}" with title "ICT Scanner — ${session.name}" subtitle "${nowStr}"${sound}'`);
   } catch {}
 
-  // iMessage
+  // iMessage — only text the "place a trade" alert when actionable; otherwise a
+  // quiet status line so you're not pinged every 4 hours for nothing.
   try {
-    const msgLines = [
-      `📡 ICT Scanner — ${session.emoji} ${session.name}`,
-      `${nowStr}`,
-      `${signals.length} signal(s) from ${watchlist.length} pairs`,
-      '',
-    ];
-    // Prepend previous session recap summary if available
-    if (recapLines.length > 0) {
-      const summaryLine = recapLines.find(l => l.startsWith('Score:'));
-      if (summaryLine) {
-        msgLines.push(`📋 Prev session: ${summaryLine}`);
-        msgLines.push('');
-      }
-    }
-    if (signals.length === 0) {
-      msgLines.push('⚪ No setups — sit on hands.');
+    const recapSummary = recapLines.find(l => l.startsWith('Resolved this run:'));
+    if (actionable.length === 0) {
+      const quiet = [
+        `📡 ICT Scanner — ${session.emoji} ${session.name} · ${nowStr}`,
+        recapSummary ? `📋 ${recapSummary}` : null,
+        `⚪ Nothing actionable (${signals.length} on radar <4/6, none at entry). Sitting on hands.`,
+      ].filter(Boolean);
+      sendIMessage(PHONE, quiet.join('\n'));
+      console.log('📱 iMessage sent (quiet status)');
     } else {
-      for (const r of signals.slice(0, 4)) {
-        const sig = buildSignal(r);
+      const msgLines = [
+        `🔥 ICT Scanner — PLACE TRADE`,
+        `${session.emoji} ${session.name} · ${nowStr}`,
+        recapSummary ? `📋 ${recapSummary}` : null,
+        '',
+      ].filter(Boolean);
+      for (const { r, sig } of actionable.slice(0, 4)) {
         const icon = sig.dir === 'LONG' ? '🟢' : '🔴';
-        msgLines.push(`${icon} ${sig.dir} ${sig.symbol.split(':')[1] ?? sig.symbol} [${sig.score}/6]`);
+        const tag = sig.atEntry ? '🔥 AT ENTRY' : '🔥 ≥4/6';
+        msgLines.push(`${icon} ${sig.dir} ${sig.symbol.split(':')[1] ?? sig.symbol} [${sig.score}/6 · edge ${r.edge.toFixed(1)}] ${tag}`);
         msgLines.push(`Entry: ${sig.entry}  SL: ${sig.stop}`);
         msgLines.push(`TP1: ${sig.tp1} (${sig.r1}:1)  TP3: ${sig.tp3} (${sig.r3}:1)`);
         if (r.smtHit) msgLines.push(`⚡ SMT confirmed`);
         msgLines.push('');
       }
+      msgLines.push('Wait for 15m CHoCH at entry. Accept full stop risk first.');
+      sendIMessage(PHONE, msgLines.join('\n'));
+      console.log('📱 iMessage sent (TRADE ALERT)');
     }
-    sendIMessage(PHONE, msgLines.join('\n'));
-    console.log('📱 iMessage sent');
   } catch (e) {
     console.error(`iMessage failed: ${e.message}`);
   }
