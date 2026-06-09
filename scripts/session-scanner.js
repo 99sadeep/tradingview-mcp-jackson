@@ -661,7 +661,13 @@ process.on('SIGINT', () => process.exit(130));
 process.on('SIGTERM', () => process.exit(143));
 
 main()
-  .then(() => releaseLock())
+  .then(() => {
+    releaseLock();
+    // The CDP websocket (src/connection.js) keeps Node's event loop alive, so the
+    // process would otherwise hang forever after the scan finishes — and hold the
+    // lock / TradingView connection. Force a clean exit.
+    process.exit(0);
+  })
   .catch(err => {
     releaseLock();
     console.error('Scanner failed:', err.message);
