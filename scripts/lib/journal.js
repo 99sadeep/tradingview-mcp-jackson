@@ -149,11 +149,25 @@ export async function resolveOpenSignals(checkFn, now = new Date()) {
     r.currentPips = res.currentPips ?? null;
     const ageDays = (now.getTime() / 1000 - r.ts) / 86400;
 
+    // Entry never filled → no trade. Not a win, not a loss. Mark NO_FILL once the
+    // setup is stale (price had time to pull back and didn't); else leave OPEN.
+    if (res.filled === false) {
+      if (ageDays > 0.75) {
+        r.status = 'NO_FILL';
+        r.resolvedAt = now.toISOString();
+        recap.push({ ...r, liveStatus: 'NO_FILL' });
+      } else {
+        recap.push({ ...r, liveStatus: 'PENDING' });
+      }
+      continue;
+    }
+
     if (res.firstHit === 'SL') {
       r.status = 'LOSS';
       r.exitLevel = r.sl;
       r.levelsHit = res.levelsHit?.filter(l => l !== 'SL') ?? [];
-      r.resultPips = pipsBetween(r.dir, r.entry, r.sl, r.entry);
+      r.riskPips = Math.abs(pipsBetween(r.symbol, r.dir, r.entry, r.sl));
+      r.resultPips = pipsBetween(r.symbol, r.dir, r.entry, r.sl);
       r.rMultiple = -1;
       r.resolvedAt = now.toISOString();
       recap.push({ ...r, liveStatus: 'LOSS' });
@@ -164,9 +178,9 @@ export async function resolveOpenSignals(checkFn, now = new Date()) {
       r.status = 'WIN';
       r.exitLevel = exit;
       r.levelsHit = res.levelsHit;
-      r.resultPips = pipsBetween(r.dir, r.entry, exit, r.entry);
-      const risk = Math.abs(pipsBetween(r.dir, r.entry, r.sl, r.entry)) || 1;
-      r.rMultiple = +(r.resultPips / risk).toFixed(2);
+      r.riskPips = Math.abs(pipsBetween(r.symbol, r.dir, r.entry, r.sl));
+      r.resultPips = pipsBetween(r.symbol, r.dir, r.entry, exit);
+      r.rMultiple = rMultipleRaw(r.dir, r.entry, r.sl, exit);
       r.resolvedAt = now.toISOString();
       recap.push({ ...r, liveStatus: best });
     } else if (ageDays > EXPIRE_DAYS) {
@@ -182,9 +196,25 @@ export async function resolveOpenSignals(checkFn, now = new Date()) {
   return recap;
 }
 
-function pipsBetween(dir, from, to, ref) {
-  const mult = ref > 100 ? 10 : 10000;
-  return Math.round((dir === 'LONG' ? (to - from) : (from - to)) * mult);
+// Correct pip size per asset class (JPY pairs are 0.01, not 0.1).
+export function pipSize(symbol = '') {
+  const s = String(symbol).toUpperCase();
+  if (s.includes('JPY')) return 0.01;
+  if (s.startsWith('XAU')) return 0.1;     // gold
+  if (s.startsWith('XAG')) return 0.01;    // silver
+  if (s.includes('BTC') || s.includes('ETH')) return 1;
+  return 0.0001;                            // standard FX
+}
+function pipsBetween(symbol, dir, from, to) {
+  const dist = dir === 'LONG' ? (to - from) : (from - to);
+  return Math.round(dist / pipSize(symbol));
+}
+// R-multiple straight from prices — NO pip rounding, so a tight stop can't inflate it.
+function rMultipleRaw(dir, entry, sl, exit) {
+  const risk = Math.abs(entry - sl);
+  if (!risk) return 0;
+  const reward = dir === 'LONG' ? (exit - entry) : (entry - exit);
+  return +(reward / risk).toFixed(2);
 }
 
 // ── Adaptive weights ────────────────────────────────────────────────────────

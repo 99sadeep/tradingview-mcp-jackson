@@ -20,7 +20,7 @@ import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
 import {
   recordSignals, resolveOpenSignals, recomputeWeights, loadJournal, saveJournal,
-  edgeScore, factorsFromNotes, computeStats, writeXlsx, validatedTargets,
+  edgeScore, factorsFromNotes, computeStats, writeXlsx, validatedTargets, pipSize,
 } from './lib/journal.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -228,7 +228,7 @@ function buildSignal({ symbol, price, dStr, eq, bsl, ssl, nearOB, nearFVG, score
   const liq = dir === 'LONG' ? bsl : ssl;
   const { tp1, tp2, tp3 } = validatedTargets({ dir, entry: entryZone, sl: stop, tp2: eq, tp3: liq });
 
-  const pips = n => Math.round(Math.abs(n - entryZone) * (price > 100 ? 10 : 10000));
+  const pips = n => Math.round(Math.abs(n - entryZone) / pipSize(symbol));
 
   // Has price already pulled into the entry zone? (within ~15 pips / 0.15%)
   const atEntry = Math.abs(price - entryZone) / price <= 0.0015;
@@ -323,11 +323,32 @@ async function checkOpenTrade(rec, chart, getOhlcv) {
   const checkBars = barsAfter.length > 0 ? barsAfter : bars.slice(-8);
 
   const { dir, sl, tp1, tp2, tp3 } = rec;
+
+  // ── Entry fill first ──────────────────────────────────────────────────────
+  // These are limit entries at an FVG/OB zone. The trade only exists once price
+  // trades INTO the entry (SHORT: a bar's high reaches entry; LONG: a bar's low
+  // reaches entry). If price never pulls back to fill, there is no trade — TP/SL
+  // touches afterward are meaningless. (This is what made unfilled EURJPY shorts
+  // look like wins.)
+  let fillIdx = -1;
+  for (let i = 0; i < checkBars.length; i++) {
+    const b = checkBars[i];
+    const filled = dir === 'LONG' ? b.low <= rec.entry : b.high >= rec.entry;
+    if (filled) { fillIdx = i; break; }
+  }
+  const ps0 = pipSize(rec.symbol);
+  const currentPipsNoFill = dir === 'LONG'
+    ? Math.round((currentPrice - rec.entry) / ps0) : Math.round((rec.entry - currentPrice) / ps0);
+  if (fillIdx === -1) {
+    return { filled: false, firstHit: null, levelsHit: [], currentPrice, currentPips: currentPipsNoFill };
+  }
+  const tradeBars = checkBars.slice(fillIdx); // only bars from the fill onward count
+
   let firstHit = null;
   const levelsHit = [];
   const hit = (lvl) => { if (!levelsHit.includes(lvl)) levelsHit.push(lvl); };
 
-  for (const bar of checkBars) {
+  for (const bar of tradeBars) {
     const slTouch  = dir === 'LONG' ? bar.low  <= sl  : bar.high >= sl;
     const tp1Touch = dir === 'LONG' ? bar.high >= tp1 : bar.low  <= tp1;
     const tp2Touch = tp2 != null && (dir === 'LONG' ? bar.high >= tp2 : bar.low <= tp2);
@@ -342,12 +363,12 @@ async function checkOpenTrade(rec, chart, getOhlcv) {
     if (firstHit === 'SL') break;
   }
 
-  const mult = currentPrice > 100 ? 10 : 10000;
+  const ps = pipSize(rec.symbol);
   const currentPips = dir === 'LONG'
-    ? Math.round((currentPrice - rec.entry) * mult)
-    : Math.round((rec.entry - currentPrice) * mult);
+    ? Math.round((currentPrice - rec.entry) / ps)
+    : Math.round((rec.entry - currentPrice) / ps);
 
-  return { firstHit, levelsHit, currentPrice, currentPips };
+  return { filled: true, firstHit, levelsHit, currentPrice, currentPips };
 }
 
 // ── Analyse one symbol ────────────────────────────────────────────────────────
