@@ -538,15 +538,18 @@ async function main() {
 
   // Attach built signal details + record to journal.
   const built = signals.map(r => ({ r, sig: buildSignal(r) }));
+
+  // Actionable = the "place a trade now" set: score >= 4 OR price already at entry.
+  // These are exactly the signals that get texted to the phone (= "pinged").
+  const actionable = built.filter(({ r, sig }) => r.score >= 4 || sig.atEntry);
+
   const recordPayload = built.map(({ r, sig }) => ({
     symbol: r.symbol.split(':')[1] ?? r.symbol, dir: sig.dir, score: r.score, notes: r.notes,
     entry: sig.entryNum, sl: sig.stopNum, tp1: sig.tp1Num, tp2: sig.tp2Num, tp3: sig.tp3Num,
     smtHit: r.smtHit, riskPips: sig.riskPips,
+    pinged: r.score >= 4 || sig.atEntry,
   }));
   const rec = recordSignals(recordPayload, session.name);
-
-  // Actionable = the "place a trade now" set: score >= 4 OR price already at entry.
-  const actionable = built.filter(({ r, sig }) => r.score >= 4 || sig.atEntry);
 
   console.log(`\n✅ Scan complete — ${signals.length} signal(s) ≥3/6 · ${actionable.length} actionable (≥4 or at entry)`);
   console.log(`   Journal: +${rec.added} new, ${rec.updated} still-open updated\n`);

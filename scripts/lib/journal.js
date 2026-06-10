@@ -81,6 +81,7 @@ export function recordSignals(scanResults, session, when = new Date()) {
     if (existing) {
       existing.lastSeen = isoTime;
       existing.lastScore = s.score;
+      if (s.pinged) existing.pinged = true; // once pinged, stays flagged
       updated++;
       continue;
     }
@@ -94,6 +95,7 @@ export function recordSignals(scanResults, session, when = new Date()) {
       entry: s.entry, sl: s.sl, tp1: s.tp1, tp2: s.tp2 ?? null, tp3: s.tp3 ?? null,
       riskPips: s.riskPips ?? null,
       smtHit: !!s.smtHit,
+      pinged: !!s.pinged, // was this signal texted to the phone (actionable)?
       status: 'OPEN',
       levelsHit: [],
       resultPips: null,
@@ -241,18 +243,26 @@ export function computeStats() {
 const COL = i => { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; } return s; };
 const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-function sheetXml(rows) {
+// rowStyles[i] = cell-style index for every cell in row i (0/undefined = default).
+// styled empty cells are still emitted so the whole row gets the fill.
+function sheetXml(rows, rowStyles = []) {
   const body = rows.map((row, ri) => {
+    const s = rowStyles[ri] || 0;
+    const sAttr = s ? ` s="${s}"` : '';
     const cells = row.map((val, ci) => {
       const ref = `${COL(ci)}${ri + 1}`;
-      if (val == null || val === '') return '';
-      if (typeof val === 'number' && Number.isFinite(val)) return `<c r="${ref}"><v>${val}</v></c>`;
-      return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEsc(val)}</t></is></c>`;
+      if (val == null || val === '') return s ? `<c r="${ref}"${sAttr}/>` : '';
+      if (typeof val === 'number' && Number.isFinite(val)) return `<c r="${ref}"${sAttr}><v>${val}</v></c>`;
+      return `<c r="${ref}"${sAttr} t="inlineStr"><is><t xml:space="preserve">${xmlEsc(val)}</t></is></c>`;
     }).join('');
     return `<row r="${ri + 1}">${cells}</row>`;
   }).join('');
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`;
 }
+
+// styles: 0 = default, 1 = green fill (pinged rows), 2 = bold (header)
+const STYLES_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="0" fillId="2" borderId="0" xfId="0" applyFill="1"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
 
 // minimal CRC32
 const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
@@ -289,19 +299,21 @@ function zip(files) {
   return Buffer.concat([localBuf, centralBuf, end]);
 }
 
-// sheets: [{ name, rows: [[...], ...] }]
+// sheets: [{ name, rows: [[...], ...], rowStyles?: [int] }]
 function buildXlsx(sheets) {
-  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}</Types>`;
+  const stylesRid = `rId${sheets.length + 1}`;
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}</Types>`;
   const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
   const workbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((s, i) => `<sheet name="${xmlEsc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('')}</sheets></workbook>`;
-  const wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('')}</Relationships>`;
+  const wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('')}<Relationship Id="${stylesRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
 
   const files = [
     { name: '[Content_Types].xml', data: Buffer.from(contentTypes, 'utf8') },
     { name: '_rels/.rels',          data: Buffer.from(rootRels, 'utf8') },
     { name: 'xl/workbook.xml',      data: Buffer.from(workbook, 'utf8') },
     { name: 'xl/_rels/workbook.xml.rels', data: Buffer.from(wbRels, 'utf8') },
-    ...sheets.map((s, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: Buffer.from(sheetXml(s.rows), 'utf8') })),
+    { name: 'xl/styles.xml',        data: Buffer.from(STYLES_XML, 'utf8') },
+    ...sheets.map((s, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: Buffer.from(sheetXml(s.rows, s.rowStyles), 'utf8') })),
   ];
   return zip(files);
 }
@@ -312,17 +324,19 @@ export function writeXlsx(when = new Date()) {
   const fmtPx = n => n == null ? '' : (n > 100 ? +Number(n).toFixed(2) : +Number(n).toFixed(5));
   const localTime = iso => iso ? new Date(iso).toLocaleString('en-AU', { timeZone: 'Australia/Melbourne', dateStyle: 'short', timeStyle: 'short' }) : '';
 
-  const sigHeader = ['Date (Melb)', 'Session', 'Symbol', 'Dir', 'Score', 'DailyStruct', 'Zone', '4HConfirm', 'OB', 'FVG', 'SMT',
+  const sigHeader = ['Pinged', 'Date (Melb)', 'Session', 'Symbol', 'Dir', 'Score', 'DailyStruct', 'Zone', '4HConfirm', 'OB', 'FVG', 'SMT',
     'Entry', 'SL', 'TP1', 'TP2', 'TP3', 'RiskPips', 'Status', 'LevelsHit', 'ResultPips', 'R', 'CurrentPips'];
   const yn = b => b ? 'Y' : '';
   const sigRows = [sigHeader, ...records.map(r => [
-    localTime(r.isoTime), r.session, r.symbol, r.dir, `${r.score}/6`,
+    r.pinged ? '📱 Y' : '', localTime(r.isoTime), r.session, r.symbol, r.dir, `${r.score}/6`,
     yn(r.factors?.daily_structure), yn(r.factors?.correct_zone), yn(r.factors?.h4_confirms),
     yn(r.factors?.near_ob), yn(r.factors?.fvg), yn(r.factors?.smt),
     fmtPx(r.entry), fmtPx(r.sl), fmtPx(r.tp1), fmtPx(r.tp2), fmtPx(r.tp3),
     r.riskPips ?? '', r.status, (r.levelsHit || []).join('+'),
     r.resultPips ?? '', r.rMultiple ?? '', r.currentPips ?? '',
   ])];
+  // Header bold (style 2); pinged rows green (style 1); rest default.
+  const sigStyles = [2, ...records.map(r => r.pinged ? 1 : 0)];
 
   const statsRows = [
     ['ICT/MMXM Trade Journal — Stats', '', '', ''],
@@ -351,7 +365,10 @@ export function writeXlsx(when = new Date()) {
   ];
 
   ensureDir();
-  writeFileSync(XLSX_FILE, buildXlsx([{ name: 'Signals', rows: sigRows }, { name: 'Stats', rows: statsRows }]));
+  writeFileSync(XLSX_FILE, buildXlsx([
+    { name: 'Signals', rows: sigRows, rowStyles: sigStyles },
+    { name: 'Stats', rows: statsRows, rowStyles: [2] },
+  ]));
   return XLSX_FILE;
 }
 
