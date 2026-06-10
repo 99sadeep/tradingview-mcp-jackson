@@ -494,12 +494,48 @@ export function writeXlsx(when = new Date()) {
   const summaryRows = [...acctRows, ['', ''], ['', ''], ...statsRows];
   const summaryStyles = [...acctStyles, 0, 0, ...statsStyles];
 
-  ensureDir();
-  writeFileSync(XLSX_FILE, buildXlsx([
+  const sheets = [
     { name: 'Signals', rows: sigRows, rowStyles: sigStyles },
     { name: 'Summary', rows: summaryRows, rowStyles: summaryStyles },
-  ]));
+  ];
+
+  // Optional Backtest sheet, if a results JSON exists (written by backtest-ict.js).
+  const bt = buildBacktestSheet();
+  if (bt) sheets.push(bt);
+
+  ensureDir();
+  writeFileSync(XLSX_FILE, buildXlsx(sheets));
   return XLSX_FILE;
+}
+
+const BACKTEST_FILE = join(JOURNAL_DIR, 'backtest-results.json');
+function buildBacktestSheet() {
+  if (!existsSync(BACKTEST_FILE)) return null;
+  let b; try { b = JSON.parse(readFileSync(BACKTEST_FILE, 'utf8')); } catch { return null; }
+  const rows = [], styles = [];
+  const push = (row, style = 0) => { rows.push(row); styles.push(style); };
+
+  push(['ICT Strategy Backtest', '', '', '', ''], 2);
+  push(['Generated', b.generated || '', '', '', '']);
+  push(['Window', b.window || '', '', '', '']);
+  push(['Rules', b.rules || '', '', '', '']);
+  push(['', '']);
+  push(['OVERALL', `${b.overall.trades} trades`, `${b.overall.winPct}% win`, `${b.overall.totalR}R`, `${b.overall.expR}R/trade`], 1);
+  push(['', '']);
+
+  const section = (title, list, hasTotR = true) => {
+    push([title, 'N', 'Win%', hasTotR ? 'TotR' : '', 'Exp/trade'], 2);
+    for (const r of list) push([r.key, r.n, r.winPct, hasTotR ? (r.totalR ?? '') : '', r.expR]);
+    push(['', '']);
+  };
+  if (b.byTarget) section('By exit target', b.byTarget);
+  if (b.byDirection) section('By direction', b.byDirection);
+  if (b.byScore) section('By score', b.byScore);
+  if (b.byFactor) section('By confluence factor', b.byFactor, false);
+  if (b.bySession) section('By session', b.bySession);
+  if (b.byPair) section('By pair', b.byPair);
+
+  return { name: 'Backtest', rows, rowStyles: styles };
 }
 
 export { XLSX_FILE };

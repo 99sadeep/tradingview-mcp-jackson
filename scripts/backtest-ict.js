@@ -15,7 +15,7 @@
  * Pure analysis fns are copied from session-scanner.js (kept in sync by hand) so
  * importing this never boots the live scanner.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,7 +68,12 @@ function detectFVGs(bars) {
 }
 function priceZone(price, highs, lows) {
   if (!highs.length || !lows.length) return { zone: 'UNKNOWN' };
-  const hi = Math.max(...highs.map(h => h.p)), lo = Math.min(...lows.map(l => l.p));
+  // ICT premium/discount is measured on the CURRENT dealing range — the most
+  // recent swing high & swing low — not the absolute 50-bar extremes. Using the
+  // whole-range midpoint mislabels the zone in any trend.
+  const recentHigh = Math.max(...highs.slice(-2).map(h => h.p));
+  const recentLow = Math.min(...lows.slice(-2).map(l => l.p));
+  const hi = Math.max(recentHigh, recentLow), lo = Math.min(recentHigh, recentLow);
   const eq = (hi + lo) / 2;
   return { zone: price > eq ? 'PREMIUM' : 'DISCOUNT', eq, hi, lo };
 }
@@ -273,6 +278,29 @@ async function main() {
     if (s.expR > best.expR) best = { T, ...s };
     console.log(`  ${T}R`.padEnd(10) + String(s.n).padStart(5) + pct(s.winRate).padStart(7) + s.totalR.toFixed(1).padStart(8) + s.expR.toFixed(2).padStart(8) + 'R');
   }
+
+  // ── Persist structured results → drives the xlsx "Backtest" sheet ─────────
+  const sweepRows = [1, 1.5, 2, 2.5, 3].map(T => { const s = summarize(all, T); return { key: `${T.toFixed(1)}R`, n: s.n, winPct: +(s.winRate * 100).toFixed(0), totalR: +s.totalR.toFixed(1), expR: +s.expR.toFixed(2) }; });
+  const mapG = rows => rows.map(r => ({ key: String(r.key), n: r.n, winPct: +(r.winRate * 100).toFixed(0), totalR: +r.totalR.toFixed(1), expR: +r.expR.toFixed(2) }));
+  const factorRows = Object.entries(FK).map(([k, label]) => { const s = summarize(all.filter(t => t.factors[k])); return { key: label, n: s.n, winPct: +(s.winRate * 100).toFixed(0), expR: +s.expR.toFixed(2) }; }).filter(r => r.n);
+  const results = {
+    generated: new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne', dateStyle: 'short', timeStyle: 'short' }),
+    window: `~${Math.round((Object.values(data).find(d => d.h4.length)?.h4.length || 0) / 6)} days · ${watchlist.length} pairs · 4H replay`,
+    rules: 'entry-fill required; exit TP1(2R)/SL; conservative 4H ties; zone fix applied',
+    overall: { trades: overall.n, winPct: +(overall.winRate * 100).toFixed(0), totalR: +overall.totalR.toFixed(1), expR: +overall.expR.toFixed(2) },
+    byTarget: sweepRows,
+    byDirection: mapG(groupBy(all, t => t.dir)),
+    byScore: mapG(groupBy(all, t => `${t.score}/6`)),
+    byFactor: factorRows,
+    bySession: mapG(groupBy(all, t => t.session)),
+    byPair: mapG(groupBy(all, t => t.symbol)),
+  };
+  try {
+    const out = join(homedir(), '.tradingview-mcp', 'journal', 'backtest-results.json');
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, JSON.stringify(results, null, 2));
+    console.log(`\n📊 Saved results → ${out} (run writeXlsx to refresh the Backtest sheet)`);
+  } catch (e) { console.error('could not save results:', e.message); }
 
   console.log('\n' + '─'.repeat(58));
   console.log(`💡 Best exit target: ${best.T}R → ${pct(best.winRate)} win, ${best.expR.toFixed(2)}R/trade (${best.expR > 0 ? 'PROFITABLE' : 'still negative'})`);
