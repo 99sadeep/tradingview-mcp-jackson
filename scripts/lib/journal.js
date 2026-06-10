@@ -459,11 +459,15 @@ export function writeXlsx(when = new Date()) {
   const acctStyles = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
     ...acct.rows.map(t => (t.pl > 0 ? 1 : 0))];
 
+  // Combine Account + Stats into one "Summary" sheet; Signals stays on its own.
+  const statsStyles = statsRows.map((r, i) => (i === 0 || r[1] === 'N') ? 2 : 0);
+  const summaryRows = [...acctRows, ['', ''], ['', ''], ...statsRows];
+  const summaryStyles = [...acctStyles, 0, 0, ...statsStyles];
+
   ensureDir();
   writeFileSync(XLSX_FILE, buildXlsx([
     { name: 'Signals', rows: sigRows, rowStyles: sigStyles },
-    { name: 'Account', rows: acctRows, rowStyles: acctStyles },
-    { name: 'Stats', rows: statsRows, rowStyles: [2] },
+    { name: 'Summary', rows: summaryRows, rowStyles: summaryStyles },
   ]));
   return XLSX_FILE;
 }
