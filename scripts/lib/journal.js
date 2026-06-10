@@ -55,6 +55,23 @@ export function loadWeights() {
 }
 function saveWeights(w) { ensureDir(); writeFileSync(WEIGHTS_FILE, JSON.stringify(w, null, 2)); }
 
+// ── Target validation ───────────────────────────────────────────────────────
+// Ensures TP1<TP2<TP3 all sit on the profit side of entry (beyond the prior one
+// in the trade's direction). The DOL targets (equilibrium / liquidity) are only
+// valid if they're actually beyond the previous target; otherwise — e.g. price
+// already swept past equilibrium — fall back to clean 3R / 4R multiples. SL sits
+// at 1R, so risk distance r = |entry - sl|. Fixes "wins" that were really just
+// price drifting the wrong way into a mis-placed target.
+export function validatedTargets({ dir, entry, sl, tp1, tp2, tp3 }) {
+  const r = Math.abs(entry - sl) || (entry * 0.001);
+  const sign = dir === 'LONG' ? 1 : -1;
+  const beyond = (lvl, prev) => lvl != null && Number.isFinite(lvl) && sign * (lvl - prev) > 0;
+  const t1 = beyond(tp1, entry) ? tp1 : entry + sign * 2 * r;
+  const t2 = beyond(tp2, t1)    ? tp2 : entry + sign * 3 * r;
+  const t3 = beyond(tp3, t2)    ? tp3 : entry + sign * 4 * r;
+  return { tp1: t1, tp2: t2, tp3: t3 };
+}
+
 // ── Factor extraction ───────────────────────────────────────────────────────
 export function factorsFromNotes(notes = []) {
   const text = notes.join(' · ');
@@ -239,6 +256,57 @@ export function computeStats() {
   };
 }
 
+// ── Account simulation ───────────────────────────────────────────────────────
+// Simulates trading the signals: start balance, risk a % of CURRENT equity per
+// trade (compounding), P/L = risk × the trade's R-multiple.
+// Realism guards (on by default):
+//   • dedupe   — the same level re-detected across scans (same symbol+dir, entry
+//                within 0.3%) is ONE trade, not many. Kills the ×7 EURJPY overcount.
+//   • frictionR— spread + slippage charged on every trade (default 0.1R), so a
+//                +10R gross win nets +9.9R and a tight-stop trade isn't free.
+//   • capR     — clip any single trade's |R| (default 20) so one toy-stop outlier
+//                can't dominate the curve.
+export function computeAccount({ start = 100000, riskPct = 0.01, pingedOnly = true,
+                                 dedupe = true, frictionR = 0.1, capR = 20 } = {}) {
+  let records = loadJournal()
+    .filter(r => r.status === 'WIN' || r.status === 'LOSS')
+    .filter(r => pingedOnly ? r.pinged : true)
+    .sort((a, b) => (new Date(a.resolvedAt || 0) - new Date(b.resolvedAt || 0)) || (a.ts - b.ts));
+
+  let collapsed = 0;
+  if (dedupe) {
+    const kept = [];
+    for (const r of records) {
+      const dup = kept.find(k => k.symbol === r.symbol && k.dir === r.dir &&
+        Math.abs(k.entry - r.entry) / r.entry < 0.003);
+      if (dup) { collapsed++; continue; }
+      kept.push(r);
+    }
+    records = kept;
+  }
+
+  let bal = start, peak = start, maxDD = 0, wins = 0;
+  const rows = [];
+  for (const r of records) {
+    const risk = bal * riskPct;
+    let grossR = Math.max(-capR, Math.min(capR, r.rMultiple ?? 0));
+    const netR = grossR - frictionR;            // friction always costs
+    const pl = risk * netR;
+    bal += pl;
+    if (netR > 0) wins++;
+    peak = Math.max(peak, bal);
+    maxDD = Math.max(maxDD, (peak - bal) / peak);
+    rows.push({ date: r.resolvedAt || r.isoTime, symbol: r.symbol, dir: r.dir, score: r.score,
+      grossR, netR: +netR.toFixed(2), risk, pl, balance: bal });
+  }
+  return {
+    start, riskPct, pingedOnly, dedupe, frictionR, capR, collapsed,
+    end: bal, returnPct: bal / start - 1,
+    trades: records.length, wins, losses: records.length - wins,
+    winRate: records.length ? wins / records.length : 0, maxDD, rows,
+  };
+}
+
 // ── XLSX export (dependency-free) ────────────────────────────────────────────
 const COL = i => { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; } return s; };
 const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -364,9 +432,37 @@ export function writeXlsx(when = new Date()) {
     ...stats.bySession.map(g => [g.key, g.n, g.wins, +(g.winRate * 100).toFixed(1)]),
   ];
 
+  // ── Account sheet — simulated $100k @ 1% risk, trading pinged signals ──────
+  const acct = computeAccount({ start: 100000, riskPct: 0.01, pingedOnly: true });
+  const money = n => +Number(n).toFixed(2);
+  const acctRows = [
+    ['Account Simulation — trade the pinged signals (realistic)', '', '', '', '', '', '', ''],
+    ['Starting balance', 100000, '', '', '', '', '', ''],
+    ['Risk per trade', '1% of current equity (compounding)', '', '', '', '', '', ''],
+    ['Assumptions', `dedupe same setup · friction ${acct.frictionR}R/trade · cap ${acct.capR}R`, '', '', '', '', '', ''],
+    ['Trades taken', `${acct.trades} distinct (collapsed ${acct.collapsed} repeat detections)`, '', '', '', '', '', ''],
+    ['', '', '', '', '', '', '', ''],
+    ['Final balance', money(acct.end), '', '', '', '', '', ''],
+    ['Net P/L', money(acct.end - acct.start), '', '', '', '', '', ''],
+    ['Return', +(acct.returnPct * 100).toFixed(1), '%', '', '', '', '', ''],
+    ['Win rate', acct.trades ? +(acct.winRate * 100).toFixed(1) : '', '%', '', '', '', '', ''],
+    ['Record (W/L)', `${acct.wins} / ${acct.losses}`, '', '', '', '', '', ''],
+    ['Max drawdown', +(acct.maxDD * 100).toFixed(1), '%', '', '', '', '', ''],
+    ['', '', '', '', '', '', '', ''],
+    ['#', 'Date (Melb)', 'Symbol', 'Dir', 'Gross R', 'Net R', 'Risk $', 'P/L $', 'Balance $'],
+    ...acct.rows.map((t, i) => [
+      i + 1, localTime(t.date), t.symbol, t.dir, +Number(t.grossR).toFixed(2), +Number(t.netR).toFixed(2),
+      money(t.risk), money(t.pl), money(t.balance),
+    ]),
+  ];
+  // bold the two header rows; green winning trades, plain losers (table header at index 13)
+  const acctStyles = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+    ...acct.rows.map(t => (t.pl > 0 ? 1 : 0))];
+
   ensureDir();
   writeFileSync(XLSX_FILE, buildXlsx([
     { name: 'Signals', rows: sigRows, rowStyles: sigStyles },
+    { name: 'Account', rows: acctRows, rowStyles: acctStyles },
     { name: 'Stats', rows: statsRows, rowStyles: [2] },
   ]));
   return XLSX_FILE;

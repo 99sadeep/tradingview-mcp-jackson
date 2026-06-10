@@ -19,8 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
 import {
-  recordSignals, resolveOpenSignals, recomputeWeights, loadJournal,
-  edgeScore, factorsFromNotes, computeStats, writeXlsx,
+  recordSignals, resolveOpenSignals, recomputeWeights, loadJournal, saveJournal,
+  edgeScore, factorsFromNotes, computeStats, writeXlsx, validatedTargets,
 } from './lib/journal.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -222,9 +222,11 @@ function buildSignal({ symbol, price, dStr, eq, bsl, ssl, nearOB, nearFVG, score
   const slDist = Math.max(atrApprox, Math.abs(price - (dir === 'LONG' ? ssl : bsl)) * 0.5);
 
   const stop = dir === 'LONG' ? entryZone - slDist : entryZone + slDist;
-  const tp1  = dir === 'LONG' ? entryZone + slDist * 2 : entryZone - slDist * 2;
-  const tp2  = dir === 'LONG' ? eq                      : eq;
-  const tp3  = dir === 'LONG' ? bsl                     : ssl;
+  // TP1 = 2R; TP2/TP3 prefer equilibrium + liquidity (DOL), but only if they sit
+  // on the profit side beyond the prior target — else fall back to 3R/4R. This
+  // stops price drifting the wrong way into a mis-placed target counting as a win.
+  const liq = dir === 'LONG' ? bsl : ssl;
+  const { tp1, tp2, tp3 } = validatedTargets({ dir, entry: entryZone, sl: stop, tp2: eq, tp3: liq });
 
   const pips = n => Math.round(Math.abs(n - entryZone) * (price > 100 ? 10 : 10000));
 
@@ -468,6 +470,26 @@ async function main() {
   const { watchlist, smt_pairs } = rules;
   const smtMap        = smt_pairs?.forex ?? {};
   WATCHLIST = watchlist;
+
+  // ── Migration: re-resolve all records with corrected targets ──────────────
+  // `node session-scanner.js --reresolve` fixes historical rows that were graded
+  // against mis-placed TP2/TP3, then re-evaluates every trade against real bars.
+  if (process.argv.includes('--reresolve')) {
+    const recs = loadJournal();
+    for (const r of recs) {
+      const v = validatedTargets(r);
+      r.tp1 = v.tp1; r.tp2 = v.tp2; r.tp3 = v.tp3;
+      r.status = 'OPEN'; r.levelsHit = []; r.resultPips = null;
+      r.rMultiple = null; r.exitLevel = null; r.resolvedAt = null;
+    }
+    saveJournal(recs);
+    console.log(`Re-resolving ${recs.length} records against bars (corrected targets)…`);
+    const out = await resolveOpenSignals(rec => { process.stdout.write(`  ${rec.symbol.padEnd(8)}`); return checkOpenTrade(rec, chart, getOhlcv); });
+    const s = computeStats();
+    console.log(`\n✅ Re-resolved. Now: ${s.resolved} resolved · ${s.wins}W/${s.losses}L · ${s.resolved ? (s.winRate*100).toFixed(0) : 0}% · ${s.totalR > 0 ? '+' : ''}${s.totalR}R`);
+    console.log('Journal xlsx:', writeXlsx());
+    return;
+  }
 
   // ── Resolve open trades from the journal (learning / recap) ────────────────
   // One-time bootstrap: seed the journal from the latest .md signal file so we
